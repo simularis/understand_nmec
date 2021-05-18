@@ -1,0 +1,210 @@
+---
+title: "Understanding the GBM model in RMV2.0"
+output:
+  html_notebook: 
+    df_print: paged
+---
+
+This one of our [supplements](https://simularis.github.io/understand_nmec/) to our
+[whitepaper on open-source NMEC tools](https://www.lincusenergy.com/resources/publications/).
+The previous supplements discussed the basic TOWT model and the occupancy detection algorithm.
+
+In this post, I'll address some common questions about the Gradient Boosting Machine model
+used in RMV2.0, using code to find the answers.
+
+* Where is the model stored?
+* Can you show me one regression tree from the ensemble?
+
+This post will be mostly code, and I'll skip the discussion.
+
+## Getting started
+For visualization functions of xgboost, you may need to set up some packages.
+```{r eval=FALSE}
+install.packages("igraph")
+install.packages("DiagrammeR")
+```
+
+
+As before, I've already run the RMV2.0 add-in to create my model and save a project file.
+I will just load the file into this notebook.
+```{r}
+#rds_file <- "C:/RMV2.0 Workshop/deteleme/Project_05.12.rds"
+rds_file <- "C:/RMV2.0 Workshop/deteleme/Project_05.17.rds"
+Project <- readRDS(rds_file)
+```
+
+The project has the following models.
+```{r}
+print(names(Project$model_obj_list$models_list))
+```
+
+First, let's look at the hyperparameters selected by the K-folds cross-validation grid search.
+
+```{r}
+res_baseline = Project$model_obj_list$models_list[["Data_pre_2_2.csv"]]
+print(res_baseline$tuned_parameters)
+print(res_baseline$gbm_cv_results)
+```
+
+Next, we'll get a XGB object. There are several ways to do this, depending on how we
+saved the model. We are using function calls from the xgboost library. I'll make them
+explicit for clarity.
+
+```{r}
+#library(xgboost)
+
+
+# This model was stored directly in the project file, from an element of the environment.
+# This is available from RMV2.0.
+model_as_is = res_baseline$gbm_model
+
+# These are other ways to store a GBM, for example. These are not usually stored by RMV2.0.
+#xgboost::xgb.save(gbm_model, "C:/RMV2.0 Workshop/deteleme/xgb.model")
+gbm_model1=xgboost::xgb.load("C:/RMV2.0 Workshop/deteleme/xgb.model")
+#model_raw <- xgboost::xgb.save.raw(gbm_model)
+model_raw = res_baseline$gbm_model_raw
+gbm_model2=xgboost::xgb.load.raw(model_raw)
+#model_ser <- xgboost::xgb.serialize(gbm_model)
+model_ser = res_baseline$gbm_model_serialized
+gbm_model3=xgboost::xgb.unserialize(model_ser)
+```
+
+They don't look like much yet.
+
+```{r}
+print(model_as_is)
+```
+
+```{r}
+print(gbm_model1)
+```
+
+```{r}
+print(gbm_model2)
+```
+
+```{r}
+print(gbm_model3)
+```
+
+
+
+Can we use the saved model to generate predictions from performance period data?
+```{r}
+train = res_baseline$train
+variables = res_baseline$variables
+train_input <- train[,variables]
+print(head(train_input))
+```
+
+```{r}
+y_fit0 <- predict(model_as_is, as.matrix(train_input))
+print(head(y_fit0))
+```
+
+```{r}
+y_fit1 <- predict(gbm_model1, as.matrix(train_input))
+print(head(y_fit1))
+```
+
+```{r}
+# OK, even though this object looks empty, this still works.
+y_fit2 <- predict(gbm_model2, as.matrix(train_input))
+print(head(y_fit2))
+```
+
+Now, let's apply some of XGBoost's functions for inspecting the model.
+```{r}
+# This only works when model was stored with xgb.load(), not load.raw or unserialize
+xgboost::xgb.plot.deepness(gbm_model1)
+```
+
+```{r}
+# This doesn't work unless we set the cb.gblinear.history() callback:
+try(
+  xgboost::xgb.gblinear.history(gbm_model1)
+)
+```
+
+```{r}
+# A data.table with columns Feature, Gain, Cover, Frequency
+importance_matrix <- xgboost::xgb.importance(colnames(as.matrix(train_input)), model = gbm_model1)
+
+xgboost::xgb.plot.importance(
+  importance_matrix = importance_matrix,
+  rel_to_first = TRUE, xlab = "Relative importance"
+)
+```
+
+```{r}
+# An interesting list of the trees, and their nodes and leaves
+# In the sample project, there are:
+# 400 trees/boosters, and
+# 23186-400 = 22786 non-root nodes, and
+# on average, 57 non-root nodes per tree
+# Would love to visualize one tree, for example
+model_dump = xgboost::xgb.dump(gbm_model1, with_stats=T)
+cat(paste(head(model_dump,45),"\n"),
+    "...\n",
+    paste(length(model_dump),"lines of text"),
+    sep="")
+```
+
+```{r}
+# Plot all the trees.
+# Just kidding, we have 400 trees. Seriously, don't do it.
+#xgboost::xgb.plot.tree(model = gbm_model1)
+```
+
+## Plot select trees {.tabset .tabset-fade .tabset-pills}
+Now, tree visualizations. Zoom in to see the details on the nodes.
+
+### Tree 0
+```{r fig.width=9.5}
+# Plot only the first tree and display the node IDs:
+xgboost::xgb.plot.tree(model = gbm_model1, trees = 0, show_node_id = TRUE)
+```
+
+### Tree 1
+```{r fig.width=9.5}
+# Plot only the next tree and display the node IDs:
+xgboost::xgb.plot.tree(model = gbm_model1, trees = 1, show_node_id = TRUE)
+```
+
+### Tree 398
+```{r fig.width=9.5}
+# Plot only the first tree and display the node IDs:
+xgboost::xgb.plot.tree(model = gbm_model1, trees = 398, show_node_id = TRUE)
+```
+
+### Tree 399
+```{r fig.width=9.5}
+# Plot only the first tree and display the node IDs:
+xgboost::xgb.plot.tree(model = gbm_model1, trees = 399, show_node_id = TRUE)
+```
+
+
+## Multi-tree visualization
+
+Let's try the function `xgboost::xgb.plot.multi.trees`. From the help file, here's what it does.
+
+<blockquote>
+This function tries to capture the complexity of a gradient boosted tree model
+in a cohesive way by compressing an ensemble of trees into a single tree-graph
+representation. The goal is to improve the interpretability of a model generally
+seen as black box."
+</blockquote>
+
+```{r fig.width=9.5, message=FALSE, warning=FALSE}
+xgboost::xgb.plot.multi.trees(model = gbm_model1, feature_names = variables)
+```
+
+## End of supplement 3
+
+To summarize, we explored the GBM model, and ways to save and load a GBM model created by XGBoost in R.
+We saw that the model generally stores a large amount of information, usually stored in binary,
+but that you can export a text representation. And we saw what one regression tree looks like, 
+and the kind of branching rules that were automatically generated from our data.
+
+Thank you for reading. Go back to [article](https://www.lincusenergy.com/resources/publications/)
+or [supplements](https://simularis.github.io/understand_nmec/).

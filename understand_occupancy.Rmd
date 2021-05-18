@@ -1,0 +1,327 @@
+---
+title: "Occupancy detection in RMV2.0 TOWT model"
+output:
+  html_document:
+    df_print: paged
+---
+
+This one of our [supplements](https://simularis.github.io/understand_nmec/) to our
+[whitepaper on open-source NMEC tools](https://www.lincusenergy.com/resources/publications/).
+
+In this post, I'll address some common questions about the occupancy schedule detection algorithm
+used in RMV2.0 and other popular NMEC tools, using code to find the answers.
+
+* What is the regression equation used during occupancy detection?
+* Is the 65% threshold pretty good?
+* What can go wrong?
+
+Most of these questions are answered by interacting with the [widget at the end of the page](#visualization).
+
+
+The previous supplement discussed the basic TOWT model. This post will not discuss the GBM model,
+which is the focus of [the next supplement](understand_gbm.html).
+
+In this notebook, we try to visualize the automatic occupancy detection
+algorithm used in the RMV2.0 time-of-week temperature (TOWT) model. This
+article does not promote use of the algorithm for all cases. You should
+determine whether it is appropriate for your building and usage history.
+
+
+# Intro
+
+The occupancy detection is done by `findOccUnocc()`. Comments in the code
+explain the proccess:
+
+<blockquote>
+Define 'occupied' and 'unoccupied' based on a regression
+of load on outdoor temperature: times of week that the regression usually
+underpredicts the load will be called 'occupied', the rest are 'unoccupied'
+This is not foolproof but usually works well.
+</blockquote>
+<blockquote>
+If the regression underpredicts the load more than 65% of the time
+then assume it's an occupied period.
+</blockquote>
+
+Some details are important to clarify:
+
+* These regression fit used here is thrown away after occupancy detection. It
+  is not related to the baseline model we eventually get.
+* We use a two-changepoint model to fit the 8,760-hour data against temperature,
+  and no additional variables. 
+* _Underpredict_ means residual > 0, where residual = data - regression prediction.
+* _65% of the time_: At this point, we group data points by time of week, so
+  there are 7*24 = 168 groups. For each group, we then calculate the number of
+  data points (1 per week, usually 52 total) and of those, the number of data
+  points where the regression underpredicts. If the ratio is greater than 65%
+  (an arbitrary threshold), we set this time of week as "occupied".
+
+Here is the call stack:
+
+* `observeEvent` is called in <tt>server.R</tt> to define a trigger in the Shiny app for when a user clicks "Train baseline models".
+* `train_model` (called at <tt>server.R#298</tt>, defined at <tt>utils.R#215</tt>)
+* `towt_baseline` (called at <tt>utils.R#243</tt>, defined at
+  <tt>towt_baseline.R#42</tt>)
+* `makeBaseline` (called at <tt>towt_baseline.R#74</tt>, defined at
+  <tt>towt_baseline.R#433</tt>)
+* `fitLBNLregress` (called at <tt>towt_baseline.R#491</tt>, defined at
+  <tt>towt_baseline.R#224</tt>)
+* `findOccUnocc` (called at <tt>towt_baseline.R#296</tt>, defined at
+  <tt>towt_baseline.R#186</tt>)
+
+# Recovering the data
+
+Can we recover enough data to show the process, from a saved project file? If
+not, at what point in the code do we need to store some more data?
+
+```{r, echo=FALSE, message=FALSE}
+library(dplyr)
+library(glue)
+library(RMV2.0)
+```
+
+```{r}
+# Load the 'project' file saved when you used the RMV2.0 add-in.
+rds_file <- "C:/RMV2.0 Workshop/something/Project_02.19.rds"
+Project <- readRDS(rds_file)
+i = 1
+```
+
+What next? Here, we recreate the function call to `towt_baseline`.
+
+```{r}
+
+pre_Data_i <- Project$Data_pre[[i]]
+timescaleDays <- Project$model_obj_list$models_list[[i]]$towt_model$timescaleDays
+intervalMinutes <- Project$Data_pre_summary[1,6]
+fahrenheit <- Project$fahrenheit
+
+res_baseline <- towt_baseline(train_Data = pre_Data_i,
+                              pred_Data = pre_Data_i,
+                              timescaleDays = timescaleDays,
+                              intervalMinutes = intervalMinutes,
+                              fahrenheit = fahrenheit,
+                              )
+```
+
+Now, to illustrate some of the data structures used in the next step ...
+
+```{r}
+train <- Project$model_obj_list$models_list[[i]]$train
+train
+```
+
+```{r}
+train$time <- as.POSIXlt(train$time, format="%m/%d/%y %H:%M")
+head(train$time)
+```
+
+```{r}
+pred <- Project$model_obj_list$models_list[[i]]$pred
+pred
+```
+
+```{r}
+pred$time <- as.POSIXlt(pred$time, format="%m/%d/%y %H:%M")
+head(pred$time)
+```
+
+What next? Here, we recreate the function call to `makeBaseline`. The function loops
+over a list of timestamps spaced by timescaleDays (the hyperparameter set by the user
+in the GUI, from 15 to 90 days). At each step, it sets up weights centered at the
+timestamp and calls `fitLBNLregress` to create a mini-regression. It then bundles all
+these regressions together.
+
+```{r}
+verbosity=5
+towt_model <- makeBaseline(train$time,
+                             train$eload,
+                             train$Temp,
+                             pred$time,
+                             pred$Temp,
+                             intervalMinutes=intervalMinutes,
+                             timescaleDays=timescaleDays,
+                             fahrenheit=fahrenheit,
+                             verbose=verbosity)
+
+```
+
+What next? Here, we recreate the function call to `fitLBNLregress`.
+
+```{r}
+dataTime <- train$time
+dataLoad <- train$eload
+dataTemp <- train$Temp
+predTime <- pred$time
+predTemp <- pred$Temp
+
+tempKnots = (c(40, 55, 65, 80, 90)-32)*5/9
+doTemperatureModel<-T
+verbose<-5
+
+npoints = length(dataLoad)
+t0 = min(dataTime,na.rm=T)
+t1 = max(dataTime,na.rm=T)
+deltaT = as.numeric(difftime(t1,t0,units="days"))
+nsegments = max(1,ceiling(deltaT/timescaleDays))
+segmentwidth = (npoints-1)/nsegments
+pointlist = floor(sort(npoints-segmentwidth*(0:nsegments))+0.001)
+nModelRuns = max(1,length(pointlist))
+
+#for (irun in 1:nModelRuns)
+irun <- 1
+tcenter = dataTime[pointlist[irun]]
+tDiff = as.numeric(difftime(tcenter,dataTime,units="days"))
+tDiffPred = as.numeric(difftime(tcenter,predTime,units="days"))
+weightvec = timescaleDays^2/(timescaleDays^2 + tDiff^2)
+
+regOut = fitLBNLregress(dataTime, dataLoad, dataTemp, predTime, predTemp,
+			tempKnots = tempKnots, weightvec=weightvec,
+			intervalMinutes=intervalMinutes,fahrenheit=fahrenheit,
+			doTemperatureModel=doTemperatureModel,verbose=verbose)
+```
+
+What next? Here, we recreate the function call to `findOccUnocc` (from the first step
+inside `fitLBNLregress`). Note:
+
+* This is where we first label each timestamp with an integer `intervalOfWeek` using the weekday, hour, and minute parts of the timestamp data.
+* The `intervalOfWeek` increments by 1 every `intervalMinutes` (in this project, every 60 minutes).
+* Eg., Sunday, 2006-01-01T00:00 has (wday, hour, minute) = (0,0,0). 00:00 through 00:59 would all be labeled `intervalOfWeek` = 1.
+* Eg., Sunday, 2006-01-01T01:00 has (wday, hour, minute) = (0,1,0), which is mapped to intervalOfWeek = 2.
+
+```{r}
+timeVec <- dataTime
+loadVec <- dataLoad
+tempVec <- dataTemp
+#predTime
+#predTemp
+#tempKnots
+#weightvec
+#intervalMinutes
+#fahrenheit
+#doTemperatureModel
+#verbose
+
+minuteOfWeek = 24*60*timeVec$wday+60*timeVec$hour + timeVec$min
+intervalOfWeek = 1+floor(minuteOfWeek/intervalMinutes)
+
+# If we have temperature data then fit the time-of-week-and-temperature model
+
+if (fahrenheit) {
+	# temperature vector is already in fahrenheit
+	tempVecF = tempVec
+	tempVec = (tempVec-32)*5/9
+	tempVecPredF = predTemp
+	tempVecPred = (predTemp-32)*5/9
+} else {
+	tempVecF = (tempVec*9/5)+32
+	tempVecPredF = (predTemp*9/5)+32
+	tempVecPred = predTemp
+}
+
+# findOccUnocc requires Fahrenheit temperatures; everywhere else we can use either
+#  Celsius or Fahrenheit, as long as temperature knots are set appropriately
+#
+# base occupied/unoccupied decision only on cases where we have load data:
+okload = !is.na(loadVec)
+occInfo = findOccUnocc(intervalOfWeek[okload],loadVec[okload],tempVecF[okload])
+head(occInfo,40)
+tail(occInfo,20)
+```
+
+What next? Here, we demonstrate the occupancy detection algorithm within `findOccUnocc`. Note:
+
+* `uTOW` = unique time-of-week. If `intervalMinutes`=60, then there are up to 168 such
+numbers. We do not need to sort them, which is unnecessary.
+
+
+```{r}
+intervalOfWeek2 <- intervalOfWeek[okload]
+loadVec2 <- loadVec[okload]
+TempF <- tempVecF[okload]
+#intervalMinutes
+#verbose
+
+# Figure out which times of week a building is in one of two modes
+#  (called 'occupied' or 'unoccupied')
+
+# RMV2.0 does not sort this vector. Although that doesn't matter,
+# I prefer to have it sorted now.
+#uTOW = unique(intervalOfWeek2)
+uTOW = sort(unique(intervalOfWeek2))
+nTOW = length(uTOW)
+
+# Define 'occupied' and 'unoccupied' based on a regression
+# of load on outdoor temperature: times of week that the regression usually
+# underpredicts the load will be called 'occupied', the rest are 'unoccupied'
+# This is not foolproof but usually works well.
+#
+TempF50 = TempF-50
+TempF50[TempF > 50] = 0
+TempF65 = TempF-65
+TempF65[TempF < 65] = 0
+
+if (verbose > 4) {
+	cat("Fitting temperature regression...\n")
+}
+amod = lm(loadVec2 ~ TempF50+TempF65,na.action=na.exclude)
+
+okocc = rep(0,nTOW)
+cat("Detecting occupancy ...\n")
+for (itow in 1:nTOW) {
+	okTOW = intervalOfWeek2==uTOW[itow]
+	# if the regression underpredicts the load more than 65% of the time
+	# then assume it's an occupied period
+	if ( sum(residuals(amod)[okTOW]>0,na.rm=T) > 0.65*sum(okTOW) ) {
+		okocc[itow]=1
+	}
+	if (itow < 40) {
+  cat(glue('[{format(t,width=3)}] {format(nunder,width=2)}/{format(ntotal,width=2)} -> {occ}',
+           t=uTOW[itow],
+           nunder=sum(residuals(amod)[okTOW]>0,na.rm=T),
+           ntotal=sum(okTOW),
+           occ=okocc[itow]
+           ),'\n')
+	}
+}
+cat("Etc.\n")
+occInfo = cbind(uTOW,okocc)
+```
+
+# Visualization
+To visualize the occupancy detection algorithm, I am using a customized HTML widget,
+mostly scripted in Javascript with Charts.js. (This is more
+interactive than an animation, and works better because it doesn't try to
+animate the point cloud in the background.)
+
+Try pointing the mouse over the time-of-week grid:
+
+* Vertical: from Sunday through Saturday
+* Horizontal: from midnight to midnight
+* Collapsed on: week of the year
+
+```{r, message=FALSE}
+# Step 1. Export the data to the widget.
+mydata=data.frame(x=TempF,y=loadVec2,ypred=predict(amod),tow=intervalOfWeek2,timeVec=timeVec)
+#mydata[mydata$tow<10,]
+dataByTOW=uTOW %>% purrr::map(~ mydata[mydata$tow==.x,])
+
+#fitLine = unique(mydata[with(mydata,order(x)),c('x','ypred')])
+# Using the magrittr pipe for a more object-oriented writing style.
+fitLine = data.frame(x=TempF,y=predict(amod)) %>% unique() %>% arrange(x)
+
+# Step 2. Display the widget.
+library(mywidget)
+occupancy_widget("hello, world!",dataByTOW, fitLine, 'r', mydata,
+                 width='auto', height='auto')
+```
+
+## End of supplement 2
+
+To summarize, we explored the call stack, showing how RMV2.0 invokes the automatic detection algorithm
+for occupancy schedules. We saw that there is a very simple linear regression (not yet the regression
+used in our final model) being used to draw a dividing line through our data, classifying it into low
+and high usage regimes. And we saw that a large number of holidays or unhandled daylight savings time
+shifts can confuse the algorithm.
+
+Thank you for reading. Go back to [article](https://www.lincusenergy.com/resources/publications/) or [supplements](https://simularis.github.io/understand_nmec/).
